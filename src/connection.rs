@@ -1,6 +1,6 @@
 use crate::frame::{self, Frame};
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::io::{self, Cursor};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
@@ -80,6 +80,21 @@ impl Connection {
         }
     }
 
+    pub async fn read_frame_and_copy_bytes(&mut self) -> crate::Result<Option<(Frame, Bytes)>> {
+        loop {
+            if let Some(pair) = self.parse_frame_and_copy_bytes()? {
+                return Ok(Some(pair));
+            }
+            if 0 == self.stream.read_buf(&mut self.buffer).await? {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Err("connection reset by peer".into());
+                }
+            }
+        }
+    }
+
     /// Tries to parse a frame from the buffer. If the buffer contains enough
     /// data, the frame is returned and the data removed from the buffer. If not
     /// enough data has been buffered yet, `Ok(None)` is returned. If the
@@ -141,6 +156,26 @@ impl Connection {
             // An error was encountered while parsing the frame. The connection
             // is now in an invalid state. Returning `Err` from here will result
             // in the connection being closed.
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Parse frame and also return raw bytes
+    fn parse_frame_and_copy_bytes(&mut self) -> crate::Result<Option<(Frame, Bytes)>> {
+        use frame::Error::Incomplete;
+        let mut buf = Cursor::new(&self.buffer[..]);
+        match Frame::check(&mut buf) {
+            Ok(_) => {
+                let len = buf.position() as usize;
+                buf.set_position(0);
+                let frame = Frame::parse(&mut buf)?;
+                // Discard the parsed data from the read buffer.
+                // Advance the buffer ahead while copying the content.
+                let raw_bytes = self.buffer.copy_to_bytes(len);
+                // Return the parsed frame to the caller.
+                Ok(Some((frame, raw_bytes)))
+            }
+            Err(Incomplete) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
