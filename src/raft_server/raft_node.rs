@@ -7,6 +7,7 @@ use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType};
 use raft::{storage::MemStorage, RawNode};
 use slog::{o, Drain};
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
@@ -22,6 +23,7 @@ pub(crate) struct RaftNode {
     logger: slog::Logger,
     mailboxes: HashMap<u64, mpsc::Sender<Message>>,
     request_receiver: mpsc::Receiver<Msg>,
+    callbacks: HashMap<u64, mpsc::Sender<crate::Result<crate::Frame>>>,
     shutdown: Shutdown,
     /// Not used directly. When all sender is dropped, the receiver will know everything is cleaned up.
     pub(crate) shutdown_complete_tx: mpsc::Sender<()>,
@@ -57,6 +59,7 @@ impl RaftNode {
             logger,
             mailboxes,
             request_receiver,
+            callbacks: HashMap::new(),
             shutdown,
             shutdown_complete_tx,
         }
@@ -82,9 +85,25 @@ impl RaftNode {
             };
             match msg {
                 Msg::Propose { id, cmd } => {
-                    self.raft_group
-                        .propose(Vec::from(id.to_be_bytes()), Vec::from(cmd.raw_bytes))
-                        .unwrap();
+                    let mut context = Vec::new();
+                    context.append(&mut Vec::from(self.raft_group.raft.id.to_be_bytes()));
+                    context.append(&mut Vec::from(id.to_be_bytes()));
+                    match self.raft_group.propose(context, Vec::from(cmd.raw_bytes)) {
+                        Ok(_) => {
+                            println!("Propose success, add callback to map");
+                            self.callbacks.insert(id, cmd.commit_tx);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to propose, {}", e);
+                            let callback = cmd.commit_tx;
+                            // Never wait in raft loop
+                            tokio::spawn(async move {
+                                let _ = callback
+                                    .send(Ok(crate::Frame::Error("Proposal dropped.".into())))
+                                    .await;
+                            });
+                        }
+                    }
                 }
                 Msg::RaftMsg(msg) => {
                     self.raft_group.step(msg).unwrap();
@@ -150,9 +169,20 @@ impl RaftNode {
                             let cmd = crate::Command::from_frame(frame).unwrap();
                             println!("Parsed redis cmd from entry. cmd: {:?}", cmd);
                             let resp = cmd.apply_cmd(&self.db);
-                            if !entry.context.is_empty() {
-                                // TODO: peer or self?
-                                // TODO: handle error?
+                            if entry.context.len() == 16 {
+                                let v: Vec<u8> = Vec::from(entry.context);
+                                let arr: [u8; 8] = (&v[..8]).try_into().unwrap();
+                                let raft_id = u64::from_be_bytes(arr);
+                                // peer or self?
+                                if raft_id == self.raft_group.raft.id {
+                                    let arr: [u8; 8] = (&v[8..]).try_into().unwrap();
+                                    let callback_id = u64::from_be_bytes(arr);
+                                    if let Some(callback) = self.callbacks.remove(&callback_id) {
+                                        tokio::spawn(async move {
+                                            let _ = callback.send(resp).await;
+                                        });
+                                    }
+                                }
                             }
                         }
                         Err(e) => {

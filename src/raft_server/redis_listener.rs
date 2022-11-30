@@ -118,11 +118,20 @@ impl Handler {
             self.request_sender.send(Msg::new_propose(callback)).await?;
             // Wait the proposal to be committed by raft
             // The current handle must hang up here, because redis requests should be processed in order.
-            if let Some(_) = commit_rx.recv().await {
-                cmd.apply(&self.db, &mut self.connection, &mut self.shutdown)
-                    .await?;
-            } else {
-                error!("Command callback was closed. {:?}", cmd);
+            match commit_rx.recv().await {
+                Some(Ok(frame)) => {
+                    self.connection.write_frame(&frame).await?;
+                }
+                Some(Err(e)) => {
+                    self.connection
+                        .write_frame(&crate::Frame::Error(e.to_string()))
+                        .await?;
+                }
+                None => {
+                    self.connection
+                        .write_frame(&crate::Frame::Error("command callback closed".into()))
+                        .await?;
+                }
             }
         }
 

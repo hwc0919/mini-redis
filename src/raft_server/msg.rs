@@ -21,5 +21,5 @@ impl Msg {
 #[derive(Debug)]
 pub(crate) struct CommandCallback {
     pub(crate) raw_bytes: Bytes,
-    pub(crate) commit_tx: mpsc::Sender<bool>,
+    pub(crate) commit_tx: mpsc::Sender<crate::Result<crate::Frame>>,
 }
