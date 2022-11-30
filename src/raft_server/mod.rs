@@ -35,7 +35,7 @@ pub async fn run(config: Config, shutdown: impl Future) {
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
 
     // Channel to bridge redis server and raft system
-    let (request_tx, request_rx) = mpsc::channel(1024);
+    let (raft_msg_tx, raft_msg_rx) = mpsc::channel(1024); // TODO: buffer size
 
     let mut tx_map = HashMap::new();
     for (id, addr) in config.node_addrs.into_iter() {
@@ -61,7 +61,7 @@ pub async fn run(config: Config, shutdown: impl Future) {
 
     let mut raft_receiver = RaftReceiver::new(
         raft_listener,
-        request_tx.clone(),
+        raft_msg_tx.clone(),
         notify_shutdown.clone(),
         shutdown_complete_tx.clone(),
     );
@@ -71,7 +71,7 @@ pub async fn run(config: Config, shutdown: impl Future) {
     let mut raft_node = RaftNode::new(
         config.node_id,
         db_holder.db(),
-        request_rx,
+        raft_msg_rx,
         tx_map,
         Shutdown::new(notify_shutdown.subscribe()),
         shutdown_complete_tx.clone(),
@@ -81,7 +81,7 @@ pub async fn run(config: Config, shutdown: impl Future) {
     let mut listener = Listener {
         db: db_holder.db(),
         listener: redis_listener,
-        request_sender: request_tx,
+        raft_msg_tx,
         limit_connections: Arc::new(Semaphore::new(256)),
         notify_shutdown,
         shutdown_complete_tx,

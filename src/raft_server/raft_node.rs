@@ -21,7 +21,7 @@ pub(crate) struct RaftNode {
     db: Db,
     logger: slog::Logger,
     mailboxes: HashMap<u64, mpsc::Sender<Message>>,
-    request_receiver: mpsc::Receiver<Msg>,
+    raft_msg_rx: mpsc::Receiver<Msg>,
     callbacks: HashMap<u64, mpsc::Sender<crate::Result<crate::Frame>>>,
     shutdown: Shutdown,
     /// Not used directly. When all sender is dropped, the receiver will know everything is cleaned up.
@@ -32,7 +32,7 @@ impl RaftNode {
     pub(crate) fn new(
         id: u64,
         db: Db,
-        request_receiver: mpsc::Receiver<Msg>,
+        raft_msg_rx: mpsc::Receiver<Msg>,
         mailboxes: HashMap<u64, mpsc::Sender<Message>>,
         shutdown: Shutdown,
         shutdown_complete_tx: mpsc::Sender<()>,
@@ -58,7 +58,7 @@ impl RaftNode {
             db,
             logger,
             mailboxes,
-            request_receiver,
+            raft_msg_rx,
             callbacks: HashMap::new(),
             shutdown,
             shutdown_complete_tx,
@@ -68,51 +68,49 @@ impl RaftNode {
     pub(crate) async fn run(&mut self) -> crate::Result<()> {
         let tick_intv = tokio::time::Duration::from_millis(100);
         let mut next_tick = tokio::time::Instant::now() + tick_intv;
+
         while !self.shutdown.is_shutdown() {
-            let msg = select! {
+            // QUESTION: will this select cause message dropping???
+            select! {
+                msg = self.raft_msg_rx.recv() => {
+                    match msg {
+                        Some(Msg::Propose { id, cmd }) => {
+                            let mut context = Vec::new();
+                            context.append(&mut Vec::from(self.raft_group.raft.id.to_be_bytes()));
+                            context.append(&mut Vec::from(id.to_be_bytes()));
+                            match self.raft_group.propose(context, Vec::from(cmd.raw_bytes)) {
+                                Ok(_) => {
+                                    println!("Propose success, add callback to map");
+                                    self.callbacks.insert(id, cmd.commit_tx);
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to propose, {}", e);
+                                    let callback = cmd.commit_tx;
+
+                                    let _ = callback
+                                        .try_send(Ok(crate::Frame::Error("Proposal dropped.".into())));
+                                }
+                            }
+                        }
+                        Some(Msg::RaftMsg(msg)) => {
+                            self.raft_group.step(msg).unwrap();
+                        }
+                        None => {
+                            println!("raft_msg_rx disconnected");
+                            break;
+                        }
+                    }
+                },
                 _ = tokio::time::sleep_until(next_tick) => {
                     self.raft_group.tick();
                     next_tick += tick_intv;
-                    None
                 },
                 _ = self.shutdown.recv() => {
                     break;
                 }
-                msg = self.request_receiver.recv() => match msg {
-                    Some(msg) => Some(msg),
-                    None => break
-                }
-            };
-            if let Some(msg) = msg {
-                match msg {
-                    Msg::Propose { id, cmd } => {
-                        let mut context = Vec::new();
-                        context.append(&mut Vec::from(self.raft_group.raft.id.to_be_bytes()));
-                        context.append(&mut Vec::from(id.to_be_bytes()));
-                        match self.raft_group.propose(context, Vec::from(cmd.raw_bytes)) {
-                            Ok(_) => {
-                                println!("Propose success, add callback to map");
-                                self.callbacks.insert(id, cmd.commit_tx);
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to propose, {}", e);
-                                let callback = cmd.commit_tx;
-                                // Never wait in raft loop
-                                tokio::spawn(async move {
-                                    let _ = callback
-                                        .send(Ok(crate::Frame::Error("Proposal dropped.".into())))
-                                        .await;
-                                });
-                            }
-                        }
-                    }
-                    Msg::RaftMsg(msg) => {
-                        self.raft_group.step(msg).unwrap();
-                    }
-                }
             }
 
-            self.on_ready().await;
+            self.on_ready();
         }
 
         Ok(())
@@ -200,7 +198,7 @@ impl RaftNode {
         }
     }
 
-    async fn on_ready(&mut self) {
+    fn on_ready(&mut self) {
         if !self.raft_group.has_ready() {
             return;
         }
@@ -371,7 +369,7 @@ impl RaftSender {
 
 struct RaftReceiverHandler {
     stream: TcpStream,
-    message_sender: mpsc::Sender<Msg>,
+    raft_msg_tx: mpsc::Sender<Msg>,
 
     shutdown: Shutdown,
     _shutdown_complete: mpsc::Sender<()>,
@@ -395,8 +393,8 @@ impl RaftReceiverHandler {
             println!("Read from raft peer: {:?}", buf);
             let mut msg = Message::new();
             msg.merge_from_bytes(&buf[..]).unwrap();
-            if let Err(e) = self.message_sender.send(Msg::RaftMsg(msg)).await {
-                eprintln!("Failed to send through message_sender, reason: {}", e);
+            if let Err(e) = self.raft_msg_tx.send(Msg::RaftMsg(msg)).await {
+                eprintln!("Failed to send through raft_msg_tx, reason: {}", e);
                 break;
             }
         }
@@ -407,7 +405,7 @@ impl RaftReceiverHandler {
 
 pub(crate) struct RaftReceiver {
     listener: TcpListener,
-    message_sender: mpsc::Sender<Msg>,
+    raft_msg_tx: mpsc::Sender<Msg>,
     pub(crate) notify_shutdown: broadcast::Sender<()>,
     pub(crate) shutdown_complete_tx: mpsc::Sender<()>,
 }
@@ -415,13 +413,13 @@ pub(crate) struct RaftReceiver {
 impl RaftReceiver {
     pub(crate) fn new(
         listener: TcpListener,
-        message_sender: mpsc::Sender<Msg>,
+        raft_msg_tx: mpsc::Sender<Msg>,
         notify_shutdown: broadcast::Sender<()>,
         shutdown_complete_tx: mpsc::Sender<()>,
     ) -> RaftReceiver {
         RaftReceiver {
             listener,
-            message_sender,
+            raft_msg_tx,
             notify_shutdown,
             shutdown_complete_tx,
         }
@@ -432,7 +430,7 @@ impl RaftReceiver {
             let stream = self.accept().await?;
             let mut handler = RaftReceiverHandler {
                 stream,
-                message_sender: self.message_sender.clone(),
+                raft_msg_tx: self.raft_msg_tx.clone(),
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
                 _shutdown_complete: self.shutdown_complete_tx.clone(),
             };

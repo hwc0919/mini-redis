@@ -9,7 +9,7 @@ use tracing::{debug, error, info, instrument};
 pub(crate) struct Listener {
     pub(crate) db: Db,
     pub(crate) listener: TcpListener,
-    pub(crate) request_sender: mpsc::Sender<Msg>,
+    pub(crate) raft_msg_tx: mpsc::Sender<Msg>,
     pub(crate) limit_connections: Arc<Semaphore>,
     pub(crate) notify_shutdown: broadcast::Sender<()>,
     pub(crate) shutdown_complete_tx: mpsc::Sender<()>,
@@ -19,7 +19,7 @@ pub(crate) struct Listener {
 pub(crate) struct Handler {
     db: Db,
     connection: Connection,
-    request_sender: mpsc::Sender<Msg>,
+    raft_msg_tx: mpsc::Sender<Msg>,
     shutdown: Shutdown,
     /// Not used directly. Instead, when `Handler` is dropped...?
     _shutdown_complete: mpsc::Sender<()>,
@@ -40,10 +40,11 @@ impl Listener {
             let mut handler = Handler {
                 db: self.db.clone(),
                 connection: Connection::new(socket),
-                request_sender: self.request_sender.clone(),
+                raft_msg_tx: self.raft_msg_tx.clone(),
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
                 _shutdown_complete: self.shutdown_complete_tx.clone(),
             };
+
             tokio::spawn(async move {
                 if let Err(err) = handler.run().await {
                     error!(cause = ?err, "connection error");
@@ -115,7 +116,13 @@ impl Handler {
                 commit_tx,
             };
             // Send command to raft proposal queue
-            self.request_sender.send(Msg::new_propose(callback)).await?;
+            if let Err(e) = self.raft_msg_tx.send(Msg::new_propose(callback)).await {
+                println!("Error: raft_msg_tx.send() {}", e);
+                self.connection
+                    .write_frame(&crate::Frame::Error("Failed to send raft msg".into()))
+                    .await?;
+                break;
+            }
             // Wait the proposal to be committed by raft
             // The current handle must hang up here, because redis requests should be processed in order.
             match commit_rx.recv().await {
