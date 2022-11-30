@@ -137,6 +137,19 @@ impl Set {
         Ok(())
     }
 
+    /// Same as `apply()` but return response frame instead of sending directly.
+    #[instrument(skip(self, db))]
+    pub(crate) fn apply_cmd(self, db: &Db) -> crate::Result<Frame> {
+        // Set the value in the shared database state.
+        db.set(self.key, self.value, self.expire);
+
+        // Create a success response and write it to `dst`.
+        let response = Frame::Simple("OK".to_string());
+        debug!(?response);
+
+        Ok(response)
+    }
+
     /// Converts the command into an equivalent `Frame`.
     ///
     /// This is called by the client when encoding a `Set` command to send to

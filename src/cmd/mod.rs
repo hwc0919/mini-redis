@@ -108,6 +108,16 @@ impl Command {
         }
     }
 
+    pub(crate) fn apply_cmd(self, db: &Db) -> crate::Result<Frame> {
+        use Command::*;
+
+        match self {
+            Publish(cmd) => cmd.apply_cmd(db),
+            Set(cmd) => cmd.apply_cmd(db),
+            _ => Err(format!("`{}` is unsupported in this context", self.get_name()).into()),
+        }
+    }
+
     /// Returns the command name
     pub(crate) fn get_name(&self) -> &str {
         match self {

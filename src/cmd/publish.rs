@@ -86,6 +86,13 @@ impl Publish {
         Ok(())
     }
 
+    /// Same as `apply()` but return response frame instead of sending directly.
+    pub(crate) fn apply_cmd(self, db: &Db) -> crate::Result<Frame> {
+        let num_subscribers = db.publish(&self.channel, self.message);
+        let response = Frame::Integer(num_subscribers as u64);
+        Ok(response)
+    }
+
     /// Converts the command into an equivalent `Frame`.
     ///
     /// This is called by the client when encoding a `Publish` command to send
