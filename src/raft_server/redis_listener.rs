@@ -1,5 +1,5 @@
 use super::msg::{CommandCallback, Msg};
-use crate::{Command, Connection, Db, DbDropGuard, Shutdown};
+use crate::{Command, Connection, Db, Shutdown};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc, Semaphore};
 use tracing::{debug, error, info, instrument};
 
 pub(crate) struct Listener {
-    pub(crate) db_holder: DbDropGuard,
+    pub(crate) db: Db,
     pub(crate) listener: TcpListener,
     pub(crate) request_sender: mpsc::Sender<Msg>,
     pub(crate) limit_connections: Arc<Semaphore>,
@@ -38,7 +38,7 @@ impl Listener {
                 .unwrap();
             let socket = self.accept().await?;
             let mut handler = Handler {
-                db: self.db_holder.db(),
+                db: self.db.clone(),
                 connection: Connection::new(socket),
                 request_sender: self.request_sender.clone(),
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),

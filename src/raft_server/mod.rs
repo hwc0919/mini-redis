@@ -68,9 +68,11 @@ pub async fn run(redis_listener: TcpListener, raft_listener: TcpListener, shutdo
         shutdown_complete_tx.clone(),
     );
 
+    let db_holder = DbDropGuard::new();
     // TODO: init raft
     let mut raft_node = RaftNode::new(
         config.node_id,
+        db_holder.db(),
         request_rx,
         tx_map,
         Shutdown::new(notify_shutdown.subscribe()),
@@ -79,7 +81,7 @@ pub async fn run(redis_listener: TcpListener, raft_listener: TcpListener, shutdo
 
     // Init redis
     let mut listener = Listener {
-        db_holder: DbDropGuard::new(),
+        db: db_holder.db(),
         listener: redis_listener,
         request_sender: request_tx,
         limit_connections: Arc::new(Semaphore::new(256)),

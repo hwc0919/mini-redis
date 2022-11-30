@@ -1,4 +1,5 @@
 use super::msg::Msg;
+use crate::db::Db;
 use crate::Shutdown;
 use protobuf::Message as PbMessage;
 use raft::eraftpb::Message;
@@ -17,6 +18,7 @@ use tracing::error;
 
 pub(crate) struct RaftNode {
     raft_group: RawNode<MemStorage>,
+    db: Db,
     logger: slog::Logger,
     mailboxes: HashMap<u64, mpsc::Sender<Message>>,
     request_receiver: mpsc::Receiver<Msg>,
@@ -28,6 +30,7 @@ pub(crate) struct RaftNode {
 impl RaftNode {
     pub(crate) fn new(
         id: u64,
+        db: Db,
         request_receiver: mpsc::Receiver<Msg>,
         mailboxes: HashMap<u64, mpsc::Sender<Message>>,
         shutdown: Shutdown,
@@ -50,6 +53,7 @@ impl RaftNode {
 
         RaftNode {
             raft_group,
+            db,
             logger,
             mailboxes,
             request_receiver,
@@ -138,8 +142,26 @@ impl RaftNode {
                 }
                 EntryType::EntryNormal => {
                     // TODO: !!!!!!!!!!!! handle your app logic
-                    println!("TODO: handle entry {:?}", entry);
-                    let _data = entry.data;
+                    println!("Handle entry {:?}", entry);
+                    let mut cursor = std::io::Cursor::new(&entry.data[..]);
+                    match crate::Frame::parse(&mut cursor) {
+                        Ok(frame) => {
+                            println!("Parsed redis frame from entry. Frame: {}", frame);
+                            let cmd = crate::Command::from_frame(frame).unwrap();
+                            println!("Parsed redis cmd from entry. cmd: {:?}", cmd);
+                            let resp = cmd.apply_cmd(&self.db);
+                            if !entry.context.is_empty() {
+                                // TODO: peer or self?
+                                // TODO: handle error?
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to parse frame from entry data. Entry: {:?}, reason: {}",
+                                entry, e
+                            );
+                        }
+                    }
                 }
             };
         }
