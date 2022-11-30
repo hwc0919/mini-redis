@@ -7,21 +7,25 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
+pub mod config;
 mod msg;
 mod raft_node;
 mod redis_listener;
+use config::Config;
 
 use raft_node::RaftNode;
 use raft_node::RaftSender;
 use redis_listener::Listener;
 use tracing::{error, info};
 
-struct Config {
-    node_id: u64,
-    nodes: HashMap<u64, String>,
-}
+pub async fn run(config: Config, shutdown: impl Future) {
+    // Bind a TCP listener
+    let redis_listener = TcpListener::bind(&format!("127.0.0.1:{}", config.redis_port))
+        .await
+        .unwrap();
+    let raft_addr = config.node_addrs[&config.node_id];
+    let raft_listener = TcpListener::bind(raft_addr).await.unwrap();
 
-pub async fn run(redis_listener: TcpListener, raft_listener: TcpListener, shutdown: impl Future) {
     // Every running loop will subscribe to this notify_shutdown channel.
     // Before main loop quit, sender will be dropped and all subscribers will be notified.
     let (notify_shutdown, _) = broadcast::channel(1);
@@ -33,21 +37,15 @@ pub async fn run(redis_listener: TcpListener, raft_listener: TcpListener, shutdo
     // Channel to bridge redis server and raft system
     let (request_tx, request_rx) = mpsc::channel(1024);
 
-    // TODO: read config from file
-    let mut nodes = HashMap::new();
-    nodes.insert(1, "172.16.0.121:63790".to_string());
-    nodes.insert(2, "172.16.0.122:63790".to_string());
-    nodes.insert(3, "172.16.0.123:63790".to_string());
-    let config = Config { node_id: 1, nodes };
-
     let mut tx_map = HashMap::new();
-    for (&id, addr) in config.nodes.iter() {
+    for (id, addr) in config.node_addrs.into_iter() {
         let (tx, rx) = mpsc::channel::<Message>(1024);
         tx_map.insert(id, tx);
 
         // Create connection to remote peers
         if id != config.node_id {
             let mut raft_conn = RaftSender::new(
+                id,
                 addr,
                 rx,
                 Shutdown::new(notify_shutdown.subscribe()),

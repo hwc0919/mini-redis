@@ -9,7 +9,6 @@ use slog::{o, Drain};
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -38,7 +37,8 @@ impl RaftNode {
         shutdown: Shutdown,
         shutdown_complete_tx: mpsc::Sender<()>,
     ) -> RaftNode {
-        let storage = raft::storage::MemStorage::new_with_conf_state((vec![id], vec![]));
+        let nodes_ids: Vec<u64> = mailboxes.keys().cloned().collect();
+        let storage = raft::storage::MemStorage::new_with_conf_state((nodes_ids, vec![]));
         let mut cfg = raft::Config::default();
         cfg.id = id;
         let decorator = slog_term::TermDecorator::new().build();
@@ -73,40 +73,42 @@ impl RaftNode {
                 _ = tokio::time::sleep_until(next_tick) => {
                     self.raft_group.tick();
                     next_tick += tick_intv;
-                    continue;
+                    None
                 },
                 _ = self.shutdown.recv() => {
                     break;
                 }
                 msg = self.request_receiver.recv() => match msg {
-                    Some(msg) => msg,
+                    Some(msg) => Some(msg),
                     None => break
                 }
             };
-            match msg {
-                Msg::Propose { id, cmd } => {
-                    let mut context = Vec::new();
-                    context.append(&mut Vec::from(self.raft_group.raft.id.to_be_bytes()));
-                    context.append(&mut Vec::from(id.to_be_bytes()));
-                    match self.raft_group.propose(context, Vec::from(cmd.raw_bytes)) {
-                        Ok(_) => {
-                            println!("Propose success, add callback to map");
-                            self.callbacks.insert(id, cmd.commit_tx);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to propose, {}", e);
-                            let callback = cmd.commit_tx;
-                            // Never wait in raft loop
-                            tokio::spawn(async move {
-                                let _ = callback
-                                    .send(Ok(crate::Frame::Error("Proposal dropped.".into())))
-                                    .await;
-                            });
+            if let Some(msg) = msg {
+                match msg {
+                    Msg::Propose { id, cmd } => {
+                        let mut context = Vec::new();
+                        context.append(&mut Vec::from(self.raft_group.raft.id.to_be_bytes()));
+                        context.append(&mut Vec::from(id.to_be_bytes()));
+                        match self.raft_group.propose(context, Vec::from(cmd.raw_bytes)) {
+                            Ok(_) => {
+                                println!("Propose success, add callback to map");
+                                self.callbacks.insert(id, cmd.commit_tx);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to propose, {}", e);
+                                let callback = cmd.commit_tx;
+                                // Never wait in raft loop
+                                tokio::spawn(async move {
+                                    let _ = callback
+                                        .send(Ok(crate::Frame::Error("Proposal dropped.".into())))
+                                        .await;
+                                });
+                            }
                         }
                     }
-                }
-                Msg::RaftMsg(msg) => {
-                    self.raft_group.step(msg).unwrap();
+                    Msg::RaftMsg(msg) => {
+                        self.raft_group.step(msg).unwrap();
+                    }
                 }
             }
 
@@ -117,7 +119,8 @@ impl RaftNode {
     }
 
     /// Send raft messages to peers
-    async fn handle_messages(&mut self, msgs: Vec<Message>) {
+    fn handle_messages(&mut self, msgs: Vec<Message>) {
+        println!("Handle messages: {:?}", msgs);
         for msg in msgs {
             let to = msg.to;
             if let Err(e) = self.mailboxes[&to].try_send(msg) {
@@ -208,7 +211,7 @@ impl RaftNode {
         // 1. Check whether messages is empty or not. If not, it means that the node will send messages to other nodes:
         if !ready.messages().is_empty() {
             // Send out the messages come from the node.
-            self.handle_messages(ready.take_messages()).await;
+            self.handle_messages(ready.take_messages());
         }
 
         // 2. Check whether snapshot is empty or not.
@@ -254,7 +257,7 @@ impl RaftNode {
         // after persisting hardstate,entries and snapshot:
         if !ready.persisted_messages().is_empty() {
             // Send persisted messages to other peers.
-            self.handle_messages(ready.take_persisted_messages()).await;
+            self.handle_messages(ready.take_persisted_messages());
         }
 
         // 7. Call advance to notify that the previous work is completed.
@@ -270,13 +273,14 @@ impl RaftNode {
                 .mut_hard_state()
                 .set_commit(commit);
         }
-        self.handle_messages(light_rd.take_messages()).await;
+        self.handle_messages(light_rd.take_messages());
         self.handle_committed_entries(light_rd.take_committed_entries());
         self.raft_group.advance_apply();
     }
 }
 
 pub(crate) struct RaftSender {
+    peer_id: u64,
     addr: SocketAddr,
     receiver: mpsc::Receiver<Message>,
     stream: Option<TcpStream>,
@@ -286,14 +290,14 @@ pub(crate) struct RaftSender {
 
 impl RaftSender {
     pub(crate) fn new(
-        addr: &str,
+        peer_id: u64,
+        addr: SocketAddr,
         receiver: mpsc::Receiver<Message>,
         shutdown: Shutdown,
         shutdown_complete_tx: mpsc::Sender<()>,
     ) -> RaftSender {
-        let addr = SocketAddr::from_str(addr).unwrap();
-
         RaftSender {
+            peer_id,
             addr,
             receiver,
             stream: None,
@@ -303,8 +307,10 @@ impl RaftSender {
     }
 
     pub(crate) async fn run(&mut self) {
+        println!("11111111111111");
         let mut last_msg = None;
         while !self.shutdown.is_shutdown() {
+            println!("222222222222222");
             let stream = match &mut self.stream {
                 Some(stream) => stream,
                 None => {
@@ -321,8 +327,11 @@ impl RaftSender {
             };
 
             'inner: loop {
+                println!("333333333333333333");
                 if let None = last_msg {
+                    println!("RECV RECV RECV");
                     last_msg = self.receiver.recv().await;
+                    println!("RaftSender ready to send message: {:?}", last_msg);
                 }
                 match last_msg.take() {
                     Some(msg) => {
@@ -337,7 +346,10 @@ impl RaftSender {
                         last_msg = None;
                     }
                     // Channel closed, stop running.
-                    None => return,
+                    None => {
+                        println!("RaftSender to peer {} returned", self.peer_id);
+                        return;
+                    }
                 }
             }
         }
@@ -380,6 +392,7 @@ impl RaftReceiverHandler {
                 }
             };
 
+            println!("Read from raft peer: {:?}", buf);
             let mut msg = Message::new();
             msg.merge_from_bytes(&buf[..]).unwrap();
             if let Err(e) = self.message_sender.send(Msg::RaftMsg(msg)).await {
