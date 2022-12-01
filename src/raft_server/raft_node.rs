@@ -1,6 +1,7 @@
 use super::msg::Msg;
 use crate::db::Db;
 use crate::Shutdown;
+use bytes::{Buf, BufMut, BytesMut};
 use protobuf::Message as PbMessage;
 use raft::eraftpb::Message;
 use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType};
@@ -10,7 +11,7 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{broadcast, mpsc};
@@ -333,7 +334,12 @@ impl RaftSender {
                 }
                 match last_msg.take() {
                     Some(msg) => {
-                        let bytes = msg.write_to_bytes().unwrap();
+                        let mut msg_bytes = msg.write_to_bytes().unwrap();
+                        let msg_len = msg_bytes.len();
+                        let mut bytes = Vec::new();
+                        bytes.put_u64(msg_len as u64);
+                        bytes.append(&mut msg_bytes);
+
                         if let Err(e) = stream.write(&bytes[..]).await {
                             // Connection disconnected
                             eprintln!("Failed to write to peer, {}", e);
@@ -376,23 +382,51 @@ struct RaftReceiverHandler {
 }
 
 impl RaftReceiverHandler {
-    async fn run(&mut self) -> crate::Result<()> {
+    async fn run(mut self) -> crate::Result<()> {
+        let mut stream = BufWriter::new(self.stream);
+        let mut msg_len: usize = 0;
+        let mut buf = BytesMut::new();
+
         while !self.shutdown.is_shutdown() {
-            // TODO: read from peer
-            // Two ways: use a rpc crate, or encapsulate a Connection struct
-            let mut buf = bytes::BytesMut::new();
             tokio::select! {
-                res = self.stream.read(&mut buf) => {
-                      res?
+                res = stream.read_buf(&mut buf) => {
+                    println!("RaftReceiverHandler.read(), res: {:?}", res);
+                    match res {
+                        Ok(len) => {
+                            if len == 0 {
+                                eprintln!("Raft peer close connection");
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Error read from raft peer, {}", e);
+                            break;
+                        }
+                    }
                 },
                 _ = self.shutdown.recv() => {
                     break;
                 }
             };
 
+            println!("RaftReceiverHandler msg_len {}", msg_len);
+            if msg_len == 0 {
+                if buf.len() < 8 {
+                    continue;
+                }
+                // peek u64
+                msg_len = u64::from_be_bytes((&buf[..8]).try_into().unwrap()) as usize;
+                buf.advance(8);
+            }
+            if buf.len() < msg_len {
+                continue;
+            }
+
             println!("Read from raft peer: {:?}", buf);
             let mut msg = Message::new();
-            msg.merge_from_bytes(&buf[..]).unwrap();
+            msg.merge_from_bytes(&buf[..msg_len]).unwrap();
+            buf.advance(msg_len);
+            msg_len = 0;
             if let Err(e) = self.raft_msg_tx.send(Msg::RaftMsg(msg)).await {
                 eprintln!("Failed to send through raft_msg_tx, reason: {}", e);
                 break;
@@ -428,7 +462,7 @@ impl RaftReceiver {
     pub(crate) async fn run(&mut self) -> crate::Result<()> {
         loop {
             let stream = self.accept().await?;
-            let mut handler = RaftReceiverHandler {
+            let handler = RaftReceiverHandler {
                 stream,
                 raft_msg_tx: self.raft_msg_tx.clone(),
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
