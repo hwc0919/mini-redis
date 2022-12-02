@@ -387,7 +387,7 @@ impl RaftReceiverHandler {
         let mut msg_len: usize = 0;
         let mut buf = BytesMut::new();
 
-        while !self.shutdown.is_shutdown() {
+        'outer: while !self.shutdown.is_shutdown() {
             tokio::select! {
                 res = stream.read_buf(&mut buf) => {
                     println!("RaftReceiverHandler.read(), res: {:?}", res);
@@ -409,27 +409,29 @@ impl RaftReceiverHandler {
                 }
             };
 
-            println!("RaftReceiverHandler msg_len {}", msg_len);
-            if msg_len == 0 {
-                if buf.len() < 8 {
-                    continue;
+            'inner: loop {
+                println!("RaftReceiverHandler msg_len {}", msg_len);
+                if msg_len == 0 {
+                    if buf.len() < 8 {
+                        break 'inner;
+                    }
+                    // peek u64
+                    msg_len = u64::from_be_bytes((&buf[..8]).try_into().unwrap()) as usize;
+                    buf.advance(8);
                 }
-                // peek u64
-                msg_len = u64::from_be_bytes((&buf[..8]).try_into().unwrap()) as usize;
-                buf.advance(8);
-            }
-            if buf.len() < msg_len {
-                continue;
-            }
+                if buf.len() < msg_len {
+                    break 'inner;
+                }
 
-            println!("Read from raft peer: {:?}", buf);
-            let mut msg = Message::new();
-            msg.merge_from_bytes(&buf[..msg_len]).unwrap();
-            buf.advance(msg_len);
-            msg_len = 0;
-            if let Err(e) = self.raft_msg_tx.send(Msg::RaftMsg(msg)).await {
-                eprintln!("Failed to send through raft_msg_tx, reason: {}", e);
-                break;
+                println!("Read from raft peer: {:?}", buf);
+                let mut msg = Message::new();
+                msg.merge_from_bytes(&buf[..msg_len]).unwrap();
+                buf.advance(msg_len);
+                msg_len = 0;
+                if let Err(e) = self.raft_msg_tx.send(Msg::RaftMsg(msg)).await {
+                    eprintln!("Failed to send through raft_msg_tx, reason: {}", e);
+                    break 'outer;
+                }
             }
         }
 
