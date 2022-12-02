@@ -93,8 +93,14 @@ impl RaftNode {
                                 }
                             }
                         }
-                        Some(Msg::RaftMsg(msg)) => {
-                            self.raft_group.step(msg).unwrap();
+                        Some(Msg::RaftMsg(msg)) =>
+                        {
+                            match self.raft_group.step(msg) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    eprintln!("Failed to step msg, reason: {}", e);
+                                }
+                            };
                         }
                         None => {
                             println!("raft_msg_rx disconnected");
